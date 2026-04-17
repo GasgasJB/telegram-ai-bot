@@ -1,5 +1,7 @@
+import ast
 import json
 import logging
+import operator
 import os
 import sqlite3
 import urllib.parse
@@ -33,8 +35,10 @@ SYSTEM_PROMPT = (
     "Eres directo y conciso: das respuestas útiles sin rodeos, pero con calidez. "
     "Cuando no sabes algo, lo reconoces con honestidad en lugar de inventar. "
     "Puedes usar emojis con moderación para hacer la conversación más natural. "
-    "Tienes acceso a herramientas para consultar el tiempo actual de cualquier ciudad "
-    "y para obtener la fecha y hora actuales; úsalas cuando el usuario las necesite."
+    "Tienes acceso a herramientas para consultar el tiempo actual de cualquier ciudad, "
+    "obtener la fecha y hora actuales, calcular expresiones matemáticas, "
+    "y guardar o recuperar notas personales del usuario. "
+    "Cuando una tarea requiera varias herramientas, encadénalas en el mismo turno."
 )
 
 TOOLS = [
@@ -69,6 +73,63 @@ TOOLS = [
             "required": [],
         },
     },
+    {
+        "name": "calculate",
+        "description": (
+            "Evalúa una expresión matemática de forma segura y devuelve el resultado. "
+            "Soporta operaciones básicas (+, -, *, /), potencias (**), módulo (%), "
+            "paréntesis y números decimales. "
+            "Úsalo cuando el usuario pida calcular, resolver o evaluar una expresión numérica."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "expression": {
+                    "type": "string",
+                    "description": "Expresión matemática a evaluar, p. ej.: '2 + 2', '(3.5 * 4) / 2', '2 ** 10'",
+                }
+            },
+            "required": ["expression"],
+        },
+    },
+    {
+        "name": "save_note",
+        "description": (
+            "Guarda una nota personal del usuario en la base de datos. "
+            "Úsalo cuando el usuario quiera apuntar, recordar o guardar algo para más tarde."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Título breve de la nota",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Contenido completo de la nota",
+                },
+            },
+            "required": ["title", "content"],
+        },
+    },
+    {
+        "name": "get_notes",
+        "description": (
+            "Recupera las notas personales guardadas del usuario. "
+            "Úsalo cuando el usuario pida ver, listar o recuperar sus notas."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "search": {
+                    "type": "string",
+                    "description": "Término opcional para filtrar notas por título o contenido",
+                }
+            },
+            "required": [],
+        },
+    },
 ]
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -91,6 +152,15 @@ def _init_db() -> sqlite3.Connection:
             role      TEXT    NOT NULL,
             content   TEXT    NOT NULL,
             created_at TEXT   NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS notes (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER NOT NULL,
+            title      TEXT    NOT NULL,
+            content    TEXT    NOT NULL,
+            created_at TEXT    NOT NULL
         )
     """)
     conn.commit()
@@ -163,11 +233,88 @@ def _get_current_datetime() -> str:
     )
 
 
-def _execute_tool(name: str, tool_input: dict) -> str:
+# Nodos AST permitidos en expresiones matemáticas (no eval arbitrario)
+_SAFE_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Pow: operator.pow,
+    ast.Mod: operator.mod,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+
+def _safe_eval(node: ast.AST) -> float:
+    if isinstance(node, ast.Expression):
+        return _safe_eval(node.body)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return float(node.value)
+    if isinstance(node, ast.BinOp) and type(node.op) in _SAFE_OPS:
+        return _SAFE_OPS[type(node.op)](_safe_eval(node.left), _safe_eval(node.right))
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _SAFE_OPS:
+        return _SAFE_OPS[type(node.op)](_safe_eval(node.operand))
+    raise ValueError(f"Operación no permitida: {ast.dump(node)}")
+
+
+def _calculate(expression: str) -> str:
+    try:
+        tree = ast.parse(expression.strip(), mode="eval")
+        result = _safe_eval(tree)
+        # Mostrar entero si no hay decimales significativos
+        if result == int(result):
+            return f"{expression} = {int(result)}"
+        return f"{expression} = {result}"
+    except ZeroDivisionError:
+        return "Error: división por cero."
+    except Exception as exc:
+        return f"No se pudo evaluar la expresión: {exc}"
+
+
+def _save_note(user_id: int, title: str, content: str) -> str:
+    db.execute(
+        "INSERT INTO notes (user_id, title, content, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, title, content, datetime.now().isoformat()),
+    )
+    db.commit()
+    return f"Nota '{title}' guardada correctamente."
+
+
+def _get_notes(user_id: int, search: str = "") -> str:
+    if search:
+        rows = db.execute(
+            "SELECT title, content, created_at FROM notes WHERE user_id = ? "
+            "AND (title LIKE ? OR content LIKE ?) ORDER BY id DESC",
+            (user_id, f"%{search}%", f"%{search}%"),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT title, content, created_at FROM notes WHERE user_id = ? ORDER BY id DESC",
+            (user_id,),
+        ).fetchall()
+
+    if not rows:
+        return "No tienes notas guardadas." if not search else f"No se encontraron notas con '{search}'."
+
+    parts = []
+    for title, content, created_at in rows:
+        date = created_at[:10]
+        parts.append(f"📌 {title} ({date})\n{content}")
+    return "\n\n".join(parts)
+
+
+def _execute_tool(name: str, tool_input: dict, user_id: int = 0) -> str:
     if name == "get_weather":
         return _get_weather(tool_input["city"])
     if name == "get_current_datetime":
         return _get_current_datetime()
+    if name == "calculate":
+        return _calculate(tool_input["expression"])
+    if name == "save_note":
+        return _save_note(user_id, tool_input["title"], tool_input["content"])
+    if name == "get_notes":
+        return _get_notes(user_id, tool_input.get("search", ""))
     return f"Herramienta '{name}' desconocida."
 
 
@@ -177,8 +324,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Hola! Soy un asistente impulsado por Claude de Anthropic.\n"
         "Escríbeme cualquier mensaje y te responderé.\n\n"
-        "También puedo consultar el tiempo de cualquier ciudad 🌤️ "
-        "y decirte la fecha y hora actuales 🕐.\n\n"
+        "Herramientas disponibles:\n"
+        "🌤️ Consultar el tiempo de cualquier ciudad\n"
+        "🕐 Fecha y hora actuales\n"
+        "🧮 Calcular expresiones matemáticas\n"
+        "📝 Guardar y recuperar notas personales\n\n"
         "Comandos disponibles:\n"
         "/start - Mostrar este mensaje\n"
         "/clear - Borrar el historial de conversación"
@@ -235,7 +385,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     if block.type == "tool_use":
                         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
                         logger.info("Calling tool %r with input %s", block.name, block.input)
-                        result = _execute_tool(block.name, block.input)
+                        result = _execute_tool(block.name, block.input, user_id)
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": block.id,
