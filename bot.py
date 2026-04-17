@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import sqlite3
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -24,6 +25,7 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "1024"))
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
+DB_PATH = os.getenv("DB_PATH", "conversations.db")
 
 SYSTEM_PROMPT = (
     "Eres un asistente inteligente, cercano y con sentido del humor. "
@@ -73,6 +75,48 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # Per-user conversation history: {user_id: [{"role": ..., "content": ...}]}
 conversation_history: dict[int, list[dict]] = {}
+
+# SQLite connection (asyncio is single-threaded so check_same_thread=False is safe)
+db: sqlite3.Connection
+
+
+# --- Database helpers ---
+
+def _init_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id   INTEGER NOT NULL,
+            role      TEXT    NOT NULL,
+            content   TEXT    NOT NULL,
+            created_at TEXT   NOT NULL
+        )
+    """)
+    conn.commit()
+    logger.info("Base de datos inicializada en %s", DB_PATH)
+    return conn
+
+
+def _load_history(user_id: int) -> list[dict]:
+    rows = db.execute(
+        "SELECT role, content FROM messages WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+        (user_id, MAX_HISTORY),
+    ).fetchall()
+    return [{"role": role, "content": content} for role, content in reversed(rows)]
+
+
+def _save_message(user_id: int, role: str, content: str) -> None:
+    db.execute(
+        "INSERT INTO messages (user_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, role, content, datetime.now().isoformat()),
+    )
+    db.commit()
+
+
+def _delete_history(user_id: int) -> None:
+    db.execute("DELETE FROM messages WHERE user_id = ?", (user_id,))
+    db.commit()
 
 
 # --- Tool implementations ---
@@ -143,6 +187,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
+    _delete_history(user_id)
     conversation_history.pop(user_id, None)
     await update.message.reply_text("Historial de conversación borrado.")
 
@@ -154,8 +199,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
-    history = conversation_history.setdefault(user_id, [])
+    # Load history from DB on first contact this session
+    if user_id not in conversation_history:
+        conversation_history[user_id] = _load_history(user_id)
+        logger.info("Historial cargado para user_id=%d (%d mensajes)", user_id, len(conversation_history[user_id]))
+
+    history = conversation_history[user_id]
     history.append({"role": "user", "content": user_text})
+    _save_message(user_id, "user", user_text)
 
     if len(history) > MAX_HISTORY:
         conversation_history[user_id] = history[-MAX_HISTORY:]
@@ -202,18 +253,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             break
 
         history.append({"role": "assistant", "content": assistant_text})
+        _save_message(user_id, "assistant", assistant_text)
         await update.message.reply_text(assistant_text)
 
     except anthropic.APIError as e:
         logger.error("Anthropic API error: %s", e)
         # Remove the user message that failed so history stays consistent
         history.pop()
+        _delete_history(user_id)
+        # Repopulate DB from the in-memory history that we rolled back
+        for msg in history:
+            _save_message(user_id, msg["role"], msg["content"])
         await update.message.reply_text(
             "Lo siento, hubo un error al contactar con la API de Claude. Inténtalo de nuevo."
         )
 
 
 def main() -> None:
+    global db
+    db = _init_db()
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
